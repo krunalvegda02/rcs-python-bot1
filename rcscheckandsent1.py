@@ -442,13 +442,13 @@ def print_all_non_capable_numbers(non_capable_numbers):
     print("=" * 80)
 
     # Also save to a file for reference
-    try:
-        with open(f"non_capable_numbers_{int(time.time())}.txt", "w") as f:
-            for num in non_capable_sorted:
-                f.write(f"{num}\n")
-        print(f"📄 Non-capable numbers saved to: non_capable_numbers_{int(time.time())}.txt")
-    except Exception as e:
-        print(f"⚠️ Could not save to file: {e}")
+    # try:
+    #     with open(f"non_capable_numbers_{int(time.time())}.txt", "w") as f:
+    #         for num in non_capable_sorted:
+    #             f.write(f"{num}\n")
+    #     print(f"📄 Non-capable numbers saved to: non_capable_numbers_{int(time.time())}.txt")
+    # except Exception as e:
+    #     print(f"⚠️ Could not save to file: {e}")
 
 
 def check_rcs_capabilities(phone_numbers):
