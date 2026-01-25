@@ -437,7 +437,7 @@ def print_all_non_capable_numbers(non_capable_numbers):
     for i in range(0, len(non_capable_sorted), cols):
         row = non_capable_sorted[i:i + cols]
         row_str = "  ".join(f"{num:>12}" for num in row)
-        print(row_str)
+        # print(row_str)
 
     print("=" * 80)
 
