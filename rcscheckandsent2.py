@@ -18,6 +18,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 fail = 0
 count = 0
 token = 0
+token_generated_time = 0
 ASSISTANT_ID = 0
 CLIENT_SECRET = 0
 phonelist = []
@@ -31,6 +32,8 @@ lock = threading.Lock()
 capable_numbers = []
 non_capable_numbers = []
 missing_numbers = []
+should_refresh_token = False
+token_refresh_lock = threading.Lock()
 
 # Database configuration
 MONGODB_URI = "mongodb+srv://sikarwarvishal75_db_user:Gama%40123@cluster0.whqwih.mongodb.net/rcs?retryWrites=true&w=majority"
@@ -40,6 +43,8 @@ DATABASE_NAME = "rcs"
 MAX_API_LIMIT = 10000
 MIN_BATCH_SIZE = 500
 CONCURRENCY = 30
+TOKEN_REFRESH_INTERVAL = 2400  # Refresh token every 40 minutes (2400 seconds)
+TOKEN_EXPIRY_TIME = 3600  # Token expires in 1 hour (3600 seconds)
 
 
 def get_utc_now():
@@ -274,15 +279,53 @@ def get_token(ASSISTANT_ID, CLIENT_SECRET):
     }
 
     print(f"  🔑 Getting authentication token...")
-    response = requests.get(url, params=params, verify=False, timeout=10)
-    if response.status_code == 200:
-        token = response.json()["access_token"]
-        print(f"  ✅ Token generated")
-        return token
-    else:
-        print(f"  ❌ Failed to get token: {response.status_code}")
-        print(f"  Response: {response.text}")
+    try:
+        response = requests.get(url, params=params, verify=False, timeout=10)
+        if response.status_code == 200:
+            token = response.json()["access_token"]
+            print(f"  ✅ Token generated")
+            return token
+        else:
+            print(f"  ❌ Failed to get token: {response.status_code}")
+            print(f"  Response: {response.text}")
+            return None
+    except Exception as e:
+        print(f"  ❌ Exception getting token: {e}")
         return None
+
+
+def refresh_token_if_needed():
+    """Check if token needs refresh and refresh if necessary"""
+    global token, token_generated_time, ASSISTANT_ID, CLIENT_SECRET, should_refresh_token
+
+    with token_refresh_lock:
+        current_time = time.time()
+
+        # Check if token needs refresh (every 40 minutes)
+        if token and (current_time - token_generated_time) >= TOKEN_REFRESH_INTERVAL:
+            print(f"🔄 Token expired or about to expire. Refreshing...")
+            new_token = get_token(ASSISTANT_ID, CLIENT_SECRET)
+            if new_token:
+                token = new_token
+                token_generated_time = current_time
+                print(f"✅ Token refreshed successfully")
+                should_refresh_token = False
+                return True
+            else:
+                print(f"❌ Failed to refresh token")
+                return False
+
+        # Also check if token is None (first time)
+        if not token:
+            new_token = get_token(ASSISTANT_ID, CLIENT_SECRET)
+            if new_token:
+                token = new_token
+                token_generated_time = current_time
+                return True
+            else:
+                return False
+
+    return True
 
 
 def format_phone_number(phone):
@@ -334,6 +377,10 @@ def check_single_user_capability(phone_number, request_id):
     """Check RCS capability for a single user - GET /v1/messaging/users/:userPhoneNumber/capabilities"""
     global token
 
+    # Check and refresh token if needed
+    if not refresh_token_if_needed():
+        return {"phone": phone_number, "capable": False, "error": "Token refresh failed"}
+
     formatted_phone = format_phone_number(phone_number)
     url = f"https://api.businessmessaging.jio.com/v1/messaging/users/{formatted_phone}/capabilities"
     params = {
@@ -364,6 +411,15 @@ def check_single_user_capability(phone_number, request_id):
 def check_batch_capability(phone_numbers_batch, batch_index, total_batches):
     """Check RCS capability for a batch of users - POST /v1/messaging/usersBatchGet"""
     global token
+
+    # Check and refresh token if needed
+    if not refresh_token_if_needed():
+        return {
+            "reachable_phones": [],
+            "batch_phones": phone_numbers_batch,
+            "error": "Token refresh failed",
+            "success": False
+        }
 
     url = "https://api.businessmessaging.jio.com/v1/messaging/usersBatchGet"
 
@@ -623,6 +679,10 @@ def send_message1(phone_number, message_id=None):
     """Send a single message - helper function"""
     global token, ASSISTANT_ID, payload
 
+    # Check and refresh token if needed
+    if not refresh_token_if_needed():
+        return 401  # Unauthorized
+
     try:
         if not message_id:
             message_id = f"msg-{uuid.uuid4().hex[:8]}"
@@ -669,6 +729,12 @@ def send_message(phone_number, message_id=None):
             "content": payload['content']
         }
 
+        # Check token before first attempt
+        if not refresh_token_if_needed():
+            retrylist.append(phone_number)
+            fail += 1
+            return
+
         # First attempt
         try:
             response = requests.post(url, headers=headers, json=data, verify=False, timeout=5)
@@ -679,6 +745,20 @@ def send_message(phone_number, message_id=None):
             count += 1
             phonelist.append(phone_number)
             return
+
+        # Check if it's a token error
+        if response.status_code == 401:
+            print(f"   🔄 Token expired, refreshing and retrying...")
+            if refresh_token_if_needed():
+                # Retry with new token
+                try:
+                    response = requests.post(url, headers=headers, json=data, verify=False, timeout=5)
+                    if response.status_code == 201:
+                        count += 1
+                        phonelist.append(phone_number)
+                        return
+                except:
+                    pass
 
         # FAST RETRY LOGIC: Immediate 200 retries
         retrylist.append(phone_number)
@@ -710,12 +790,20 @@ def worker_thread():
     """Worker function for message sending (only for capable numbers)"""
     global capable_numbers, phone_to_message_id, current_index, lock
 
+    # Each worker will refresh token periodically
+    worker_start_time = time.time()
+
     while True:
         with lock:
             if current_index >= len(capable_numbers):
                 break
             number = capable_numbers[current_index]
             current_index += 1
+
+        # Refresh token every 1000 messages or 30 minutes for this worker
+        if (current_index % 1000 == 0) or (time.time() - worker_start_time > 1800):
+            refresh_token_if_needed()
+            worker_start_time = time.time()
 
         # Get the messageId for this phone number
         message_id = phone_to_message_id.get(number)
@@ -724,9 +812,19 @@ def worker_thread():
         send_message(number, message_id)
 
 
+def periodic_token_refresher():
+    """Background thread to refresh token every 40 minutes"""
+    global should_refresh_token
+
+    while True:
+        time.sleep(TOKEN_REFRESH_INTERVAL - 300)  # Check 5 minutes before expiry
+        should_refresh_token = True
+        print("⏰ Token refresh scheduled in 5 minutes...")
+
+
 def main():
     """Main function to orchestrate the campaign sending"""
-    global phone_numbers, token, ASSISTANT_ID, CLIENT_SECRET, phone_to_message_id, maincampainid
+    global phone_numbers, token, token_generated_time, ASSISTANT_ID, CLIENT_SECRET, phone_to_message_id, maincampainid
     global current_index, payload, count, fail, phonelist, retrylist
     global capable_numbers, non_capable_numbers, missing_numbers
 
@@ -761,12 +859,18 @@ def main():
             print("❌ Failed to mark campaign as Running. Aborting.")
             return
 
-        # Get authentication token
+        # Get initial authentication token
         print(f"\n🔐 Authenticating...")
         token = get_token(ASSISTANT_ID, CLIENT_SECRET)
         if not token:
             print("❌ Authentication failed. Aborting campaign.")
             return
+        token_generated_time = time.time()
+
+        # Start background token refresher thread
+        token_refresher_thread = threading.Thread(target=periodic_token_refresher, daemon=True)
+        token_refresher_thread.start()
+        print(f"🔄 Background token refresher started (will refresh every {TOKEN_REFRESH_INTERVAL // 60} minutes)")
 
         # Store phone numbers and messageId mapping
         phone_numbers = data['phone_numbers']
@@ -803,6 +907,7 @@ def main():
 
         print(f"\n🎯 STARTING MESSAGE SENDING")
         print(f"📤 RCS capable contacts to process: {len(capable_numbers)}")
+        print(f"⏰ Token will auto-refresh every {TOKEN_REFRESH_INTERVAL // 60} minutes")
 
         # Use 100 workers as requested
         num_threads = 100
@@ -831,7 +936,8 @@ def main():
         print(f"📊 Results: {count} sent, {fail} failed, {len(retrylist)} retried")
         print(
             f"📱 Capability: {len(capable_numbers)} capable, {len(non_capable_numbers)} non-capable, {len(missing_numbers)} missing")
-        print(f"⏱️  Time: {processing_time:.2f} seconds")
+        print(f"⏱️  Total Time: {processing_time:.2f} seconds")
+        print(f"⏰ Token refreshed every {TOKEN_REFRESH_INTERVAL // 60} minutes")
 
         # STEP 4: Mark campaign as completed (separate connection)
         print("\n🔄 Marking campaign as 'completed'...")
