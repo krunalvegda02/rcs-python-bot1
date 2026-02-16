@@ -1238,11 +1238,10 @@ def safe_mongo_operation(operation_func, *args, **kwargs):
 def mark_campaign_running(campaign_id):
     """Mark campaign as Running with retry logic"""
     def _update(db):
-        if isinstance(campaign_id, str):
-            campaign_id = ObjectId(campaign_id)
+        cid = ObjectId(campaign_id) if isinstance(campaign_id, str) else campaign_id
         
         result = db.campaigns.update_one(
-            {"_id": campaign_id},
+            {"_id": cid},
             {"$set": {"status": "running", "updatedAt": get_utc_now()}}
         )
         return result.modified_count > 0
@@ -1259,11 +1258,10 @@ def mark_campaign_running(campaign_id):
 def mark_campaign_completed(campaign_id):
     """Mark campaign as completed with retry logic"""
     def _update(db):
-        if isinstance(campaign_id, str):
-            campaign_id = ObjectId(campaign_id)
+        cid = ObjectId(campaign_id) if isinstance(campaign_id, str) else campaign_id
         
         result = db.campaigns.update_one(
-            {"_id": campaign_id},
+            {"_id": cid},
             {
                 "$set": {
                     "status": "completed",
@@ -1286,11 +1284,10 @@ def mark_campaign_completed(campaign_id):
 def update_campaign_stats(campaign_id, capable_count, non_capable_count, missing_count=0):
     """Update campaign stats with retry logic"""
     def _update(db):
-        if isinstance(campaign_id, str):
-            campaign_id = ObjectId(campaign_id)
+        cid = ObjectId(campaign_id) if isinstance(campaign_id, str) else campaign_id
         
         result = db.campaigns.update_one(
-            {"_id": campaign_id},
+            {"_id": cid},
             {
                 "$set": {
                     "rcsCapableCount": capable_count,
