@@ -1045,8 +1045,6 @@
 
 
 
-
-
 import threading
 import requests
 import json
@@ -1094,7 +1092,7 @@ class BotState:
         self.phonelist = []
         self.retrylist = []
         self.maincampainid = 0
-        self.payload = ""
+        self.payload = {}
         self.phone_numbers = []
         self.phone_to_message_id = {}
         self.current_index = 0
@@ -1375,6 +1373,7 @@ def get_campaign_data():
             "client_secret": client_secret,
             "phone_numbers": unique_phones,
             "phone_message_map": phone_message_map,
+            "payload": payload,
             "total_contacts": len(unique_phones),
             "total_records": contacts_count
         }
@@ -1639,10 +1638,9 @@ def send_message_with_retry(phone_number, message_id=None, max_retries=100):
             if not message_id:
                 message_id = f"msg-{uuid.uuid4().hex[:8]}"
             else:
-                # Ensure message_id is a string
                 message_id = str(message_id)
 
-            # Build URL - IMPORTANT: Use +91 prefix correctly
+            # Build URL
             phone_clean = str(phone_number).strip()
             if not phone_clean.startswith('+91'):
                 phone_clean = f"+91{phone_clean}"
@@ -1655,52 +1653,58 @@ def send_message_with_retry(phone_number, message_id=None, max_retries=100):
                 "Content-Type": "application/json"
             }
 
-            # Make sure payload content exists
+            # Check if payload exists
             if not bot_state.payload:
                 logger.error(f"❌ No payload for {phone_number}")
                 return False
-                
-            # Extract content properly
-            content = bot_state.payload
-            if isinstance(content, dict) and 'content' in content:
-                content = content['content']
-                
-            # Handle different payload structures
+            
+            # Extract the actual content to send
             if isinstance(bot_state.payload, dict):
+                # Check if payload has a 'content' field (common pattern)
                 if 'content' in bot_state.payload:
-                    content = bot_state.payload['content']
+                    content_to_send = bot_state.payload['content']
+                    logger.debug(f"Using content from payload.content field")
                 else:
-                    content = bot_state.payload
+                    # Use the entire payload as content
+                    content_to_send = bot_state.payload
+                    logger.debug(f"Using entire payload as content")
             else:
-                content = bot_state.payload
+                content_to_send = bot_state.payload
+                logger.debug(f"Using payload as-is (type: {type(bot_state.payload)})")
+
+            # Ensure content_to_send is serializable
+            if isinstance(content_to_send, str):
+                try:
+                    # Try to parse if it's a JSON string
+                    content_to_send = json.loads(content_to_send)
+                except:
+                    # Keep as string if not valid JSON
+                    pass
 
             data = {
                 "messageTrafficType": "PROMOTION",
-                "content": content
+                "content": content_to_send
             }
 
-            # Log the request for debugging (remove in production)
             logger.debug(f"Sending to {phone_clean} with messageId {message_id}")
-
+            
             response = requests.post(
                 url, 
                 headers=headers, 
                 json=data, 
                 verify=False, 
-                timeout=10  # Increased timeout slightly
+                timeout=10
             )
 
             if response.status_code == 201:
                 logger.debug(f"✅ Successfully sent to {phone_number}")
                 return True
             elif response.status_code == 401:
-                # Token error - refresh and retry
                 logger.debug(f"🔄 Token expired for {phone_number}, refreshing...")
                 refresh_token_if_needed()
             elif response.status_code == 400:
-                # Bad request - check the error
                 logger.error(f"❌ Bad request for {phone_number}: {response.text}")
-                # Don't retry on 400 errors
+                logger.error(f"Data sent: {json.dumps(data, indent=2)[:500]}")
                 return False
             else:
                 logger.debug(f"⚠️ Got status {response.status_code} for {phone_number}, retry {attempt + 1}")
@@ -1717,7 +1721,6 @@ def send_message_with_retry(phone_number, message_id=None, max_retries=100):
                 time.sleep(0.05)
     
     return False
-
 
 def worker_thread(worker_id):
     """Worker function with heartbeat and error handling"""
@@ -1799,8 +1802,31 @@ def process_campaign():
     bot_state.client_secret = data['client_secret']
     bot_state.phone_numbers = data['phone_numbers']
     bot_state.phone_to_message_id = data.get('phone_message_map', {})
-    bot_state.payload = data.get('payload', {})
     
+    # FIX: Properly handle payload
+    payload_data = data.get('payload')
+    if payload_data:
+        if isinstance(payload_data, str):
+            try:
+                bot_state.payload = json.loads(payload_data)
+                logger.info(f"✅ Payload loaded from string (type: {type(bot_state.payload)})")
+            except json.JSONDecodeError as e:
+                logger.error(f"❌ Failed to parse payload JSON: {e}")
+                bot_state.payload = payload_data
+        else:
+            bot_state.payload = payload_data
+            logger.info(f"✅ Payload loaded from dict (type: {type(bot_state.payload)})")
+        
+        # Debug: Show payload structure
+        if isinstance(bot_state.payload, dict):
+            logger.info(f"🔍 Payload keys: {list(bot_state.payload.keys())}")
+            if 'content' in bot_state.payload:
+                logger.info(f"🔍 Content type: {type(bot_state.payload['content'])}")
+        else:
+            logger.info(f"🔍 Payload is not a dict, it's: {type(bot_state.payload)}")
+    else:
+        logger.error("❌ No payload found in campaign data")
+        bot_state.payload = {}
     
     logger.info(f"📋 Processing campaign: {data['campaign_name']} ({len(bot_state.phone_numbers)} contacts)")
     
@@ -1867,9 +1893,10 @@ def process_campaign():
         
         # Log progress
         with bot_state.lock:
-            progress = (bot_state.current_index / len(capable)) * 100
-            logger.info(f"📊 Progress: {bot_state.current_index}/{len(capable)} ({progress:.1f}%) - "
-                       f"Sent: {bot_state.count}, Failed: {bot_state.fail}")
+            if len(capable) > 0:
+                progress = (bot_state.current_index / len(capable)) * 100
+                logger.info(f"📊 Progress: {bot_state.current_index}/{len(capable)} ({progress:.1f}%) - "
+                           f"Sent: {bot_state.count}, Failed: {bot_state.fail}")
         
         # Check if workers are stuck
         if time.time() - start_time > 3600:  # 1 hour timeout
