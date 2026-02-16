@@ -1635,10 +1635,19 @@ def send_message_with_retry(phone_number, message_id=None, max_retries=100):
                 time.sleep(0.1)
                 continue
 
+            # Generate message ID if not provided
             if not message_id:
                 message_id = f"msg-{uuid.uuid4().hex[:8]}"
+            else:
+                # Ensure message_id is a string
+                message_id = str(message_id)
 
-            url = f"https://api.businessmessaging.jio.com/v1/messaging/users/+91{phone_number}/assistantMessages/async"
+            # Build URL - IMPORTANT: Use +91 prefix correctly
+            phone_clean = str(phone_number).strip()
+            if not phone_clean.startswith('+91'):
+                phone_clean = f"+91{phone_clean}"
+            
+            url = f"https://api.businessmessaging.jio.com/v1/messaging/users/{phone_clean}/assistantMessages/async"
             url += f"?messageId={message_id}&assistantId={bot_state.assistant_id}"
 
             headers = {
@@ -1646,33 +1655,69 @@ def send_message_with_retry(phone_number, message_id=None, max_retries=100):
                 "Content-Type": "application/json"
             }
 
+            # Make sure payload content exists
+            if not bot_state.payload:
+                logger.error(f"❌ No payload for {phone_number}")
+                return False
+                
+            # Extract content properly
+            content = bot_state.payload
+            if isinstance(content, dict) and 'content' in content:
+                content = content['content']
+                
+            # Handle different payload structures
+            if isinstance(bot_state.payload, dict):
+                if 'content' in bot_state.payload:
+                    content = bot_state.payload['content']
+                else:
+                    content = bot_state.payload
+            else:
+                content = bot_state.payload
+
             data = {
                 "messageTrafficType": "PROMOTION",
-                "content": bot_state.payload.get('content', {})
+                "content": content
             }
+
+            # Log the request for debugging (remove in production)
+            logger.debug(f"Sending to {phone_clean} with messageId {message_id}")
 
             response = requests.post(
                 url, 
                 headers=headers, 
                 json=data, 
                 verify=False, 
-                timeout=5
+                timeout=10  # Increased timeout slightly
             )
 
             if response.status_code == 201:
+                logger.debug(f"✅ Successfully sent to {phone_number}")
                 return True
-                
-            # Token error - refresh and retry
-            if response.status_code == 401:
+            elif response.status_code == 401:
+                # Token error - refresh and retry
+                logger.debug(f"🔄 Token expired for {phone_number}, refreshing...")
                 refresh_token_if_needed()
-                
-        except Exception as e:
-            if attempt == max_retries - 1:
-                logger.debug(f"Failed to send to {phone_number} after {max_retries} attempts")
+            elif response.status_code == 400:
+                # Bad request - check the error
+                logger.error(f"❌ Bad request for {phone_number}: {response.text}")
+                # Don't retry on 400 errors
+                return False
             else:
-                time.sleep(0.05)  # Very short delay between retries
+                logger.debug(f"⚠️ Got status {response.status_code} for {phone_number}, retry {attempt + 1}")
+                
+        except requests.exceptions.Timeout:
+            logger.debug(f"⏰ Timeout for {phone_number}, retry {attempt + 1}")
+        except requests.exceptions.ConnectionError:
+            logger.debug(f"🔌 Connection error for {phone_number}, retry {attempt + 1}")
+        except Exception as e:
+            logger.debug(f"❌ Exception for {phone_number}: {e}")
+            if attempt == max_retries - 1:
+                logger.error(f"Failed to send to {phone_number} after {max_retries} attempts: {e}")
+            else:
+                time.sleep(0.05)
     
     return False
+
 
 def worker_thread(worker_id):
     """Worker function with heartbeat and error handling"""
@@ -1755,6 +1800,7 @@ def process_campaign():
     bot_state.phone_numbers = data['phone_numbers']
     bot_state.phone_to_message_id = data.get('phone_message_map', {})
     bot_state.payload = data.get('payload', {})
+    
     
     logger.info(f"📋 Processing campaign: {data['campaign_name']} ({len(bot_state.phone_numbers)} contacts)")
     
