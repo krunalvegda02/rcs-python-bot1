@@ -1041,10 +1041,6 @@
 
 
 
-
-
-
-
 import threading
 import requests
 import json
@@ -1092,7 +1088,7 @@ class BotState:
         self.phonelist = []
         self.retrylist = []
         self.maincampainid = 0
-        self.payload = {}
+        self.payload = ""
         self.phone_numbers = []
         self.phone_to_message_id = {}
         self.current_index = 0
@@ -1107,6 +1103,14 @@ class BotState:
         self.lock = threading.Lock()
         self.token_refresh_lock = threading.Lock()
         self.worker_errors = Queue()
+
+        # ---- Multi-config support ----
+        self.is_multi_config = False
+        self.jio_configs = []            # list of {clientId, clientSecret, assistantId}
+        self.config_tokens = {}          # {configIndex: token_string}
+        self.config_token_times = {}     # {configIndex: timestamp}
+        self.phone_to_config_index = {}  # {phone: configIndex}
+        self.config_token_locks = {}     # {configIndex: Lock}
 
 bot_state = BotState()
 
@@ -1307,7 +1311,7 @@ def update_campaign_stats(campaign_id, capable_count, non_capable_count, missing
         return False
 
 def get_campaign_data():
-    """Get campaign data with connection pooling"""
+    """Get campaign data with connection pooling — single DB round-trip for all data"""
     try:
         client = get_mongo_client()
         db = client[DATABASE_NAME]
@@ -1332,23 +1336,43 @@ def get_campaign_data():
             payload = json.loads(payload)
 
         user_id = campaign.get("userId")
-        user = db.users.find_one({"_id": user_id})
-        
-        if not user or "jioConfig" not in user:
-            logger.error("❌ User or jioConfig not found")
+        # Fetch user with jioConfigs secrets included
+        user = db.users.find_one(
+            {"_id": user_id},
+            {"jioConfig": 1, "isMultiConfig": 1, "jioConfigs": 1}
+        )
+
+        if not user:
+            logger.error("❌ User not found")
             return None
 
-        jio_config = user["jioConfig"]
-        client_id = jio_config.get("clientId")
-        client_secret = jio_config.get("clientSecret")
+        # Determine single vs multi config
+        is_multi = user.get("isMultiConfig", False)
+        jio_configs_list = []
 
-        # Get phone numbers and messageIds
+        if is_multi and user.get("jioConfigs") and len(user["jioConfigs"]) > 0:
+            jio_configs_list = user["jioConfigs"]
+            logger.info(f"🔀 Multi-config mode: {len(jio_configs_list)} configs")
+            client_id = jio_configs_list[0].get("clientId")
+            client_secret = jio_configs_list[0].get("clientSecret")
+        else:
+            is_multi = False
+            jio_config = user.get("jioConfig")
+            if not jio_config:
+                logger.error("❌ jioConfig not found")
+                return None
+            client_id = jio_config.get("clientId")
+            client_secret = jio_config.get("clientSecret")
+
+        # Get phone numbers, messageIds, and configIndex in ONE query
         phone_numbers_list = []
         phone_message_map = {}
+        phone_config_map = {}  # phone -> configIndex
 
-        contacts_cursor = db.contact_campaign_messages.find({
-            "campaignId": campaign_id
-        })
+        contacts_cursor = db.contact_campaign_messages.find(
+            {"campaignId": campaign_id},
+            {"recipientPhoneNumber": 1, "messageId": 1, "configIndex": 1}  # only needed fields
+        )
 
         contacts_count = 0
         for contact in contacts_cursor:
@@ -1359,13 +1383,16 @@ def get_campaign_data():
                 message_id = contact.get("messageId")
                 if message_id:
                     phone_message_map[phone] = message_id
+                config_idx = contact.get("configIndex")
+                if config_idx is not None:
+                    phone_config_map[phone] = config_idx
 
         # Remove duplicates
         unique_phones = list(set(phone_numbers_list))
 
         logger.info(f"📊 Found {contacts_count} contact records, {len(unique_phones)} unique numbers")
 
-        return {
+        result = {
             "success": True,
             "campaign_id": str(campaign_id),
             "campaign_name": campaign_name,
@@ -1375,8 +1402,13 @@ def get_campaign_data():
             "phone_message_map": phone_message_map,
             "payload": payload,
             "total_contacts": len(unique_phones),
-            "total_records": contacts_count
+            "total_records": contacts_count,
+            "is_multi_config": is_multi,
+            "jio_configs": jio_configs_list,
+            "phone_config_map": phone_config_map
         }
+
+        return result
 
     except Exception as e:
         logger.error(f"❌ Error retrieving campaign data: {e}")
@@ -1424,32 +1456,66 @@ def get_token(assistant_id, client_secret):
     
     return None
 
-def refresh_token_if_needed():
-    """Thread-safe token refresh with retry logic"""
-    with bot_state.token_refresh_lock:
-        current_time = time.time()
-        
-        # Check if token needs refresh
-        should_refresh = (
-            not bot_state.token or
-            (current_time - bot_state.token_generated_time) >= TOKEN_REFRESH_INTERVAL
-        )
-        
-        if should_refresh:
-            logger.info("🔄 Refreshing authentication token...")
-            new_token = get_token(bot_state.assistant_id, bot_state.client_secret)
-            
-            if new_token:
-                bot_state.token = new_token
-                bot_state.token_generated_time = current_time
-                bot_state.should_refresh_token = False
-                logger.info("✅ Token refreshed successfully")
-                return True
-            else:
-                logger.error("❌ Failed to refresh token")
-                return False
-        
-        return True
+def refresh_token_if_needed(config_index=None):
+    """Thread-safe token refresh with retry logic.
+    For multi-config: pass config_index to refresh that specific config's token.
+    For single-config: pass None (default).
+    """
+    if config_index is not None and bot_state.is_multi_config:
+        # --- Multi-config: per-config token refresh ---
+        lock = bot_state.config_token_locks.get(config_index)
+        if not lock:
+            return False
+
+        with lock:
+            current_time = time.time()
+            last_time = bot_state.config_token_times.get(config_index, 0)
+            current_token = bot_state.config_tokens.get(config_index)
+
+            should_refresh = (
+                not current_token or
+                (current_time - last_time) >= TOKEN_REFRESH_INTERVAL
+            )
+
+            if should_refresh:
+                cfg = bot_state.jio_configs[config_index]
+                logger.info(f"🔄 Refreshing token for config {config_index} ({cfg.get('label', '')})...")
+                new_token = get_token(cfg["clientId"], cfg["clientSecret"])
+
+                if new_token:
+                    bot_state.config_tokens[config_index] = new_token
+                    bot_state.config_token_times[config_index] = current_time
+                    return True
+                else:
+                    logger.error(f"❌ Failed to refresh token for config {config_index}")
+                    return False
+
+            return True
+    else:
+        # --- Single-config (original behaviour) ---
+        with bot_state.token_refresh_lock:
+            current_time = time.time()
+
+            should_refresh = (
+                not bot_state.token or
+                (current_time - bot_state.token_generated_time) >= TOKEN_REFRESH_INTERVAL
+            )
+
+            if should_refresh:
+                logger.info("🔄 Refreshing authentication token...")
+                new_token = get_token(bot_state.assistant_id, bot_state.client_secret)
+
+                if new_token:
+                    bot_state.token = new_token
+                    bot_state.token_generated_time = current_time
+                    bot_state.should_refresh_token = False
+                    logger.info("✅ Token refreshed successfully")
+                    return True
+                else:
+                    logger.error("❌ Failed to refresh token")
+                    return False
+
+            return True
 
 def format_phone_number(phone):
     """Format phone number to E.164 format with error handling"""
@@ -1471,10 +1537,27 @@ def format_phone_number(phone):
         logger.error(f"Error formatting phone {phone}: {e}")
         return None
 
+def get_token_for_message(phone_number):
+    """Get the correct token + assistantId for a phone number.
+    Multi-config: looks up configIndex, returns that config's token.
+    Single-config: returns the global token.
+    No DB calls — everything is in memory.
+    """
+    if bot_state.is_multi_config:
+        config_index = bot_state.phone_to_config_index.get(phone_number, 0)
+        refresh_token_if_needed(config_index)
+        token = bot_state.config_tokens.get(config_index)
+        cfg = bot_state.jio_configs[config_index]
+        return token, cfg.get("assistantId", bot_state.assistant_id)
+    else:
+        refresh_token_if_needed()
+        return bot_state.token, bot_state.assistant_id
+
 def check_single_user_capability(phone_number, request_id):
     """Check single user capability with timeout"""
     try:
-        if not refresh_token_if_needed():
+        token, _ = get_token_for_message(phone_number)
+        if not token:
             return {"phone": phone_number, "capable": False, "error": "Token refresh failed"}
 
         formatted_phone = format_phone_number(phone_number)
@@ -1484,7 +1567,7 @@ def check_single_user_capability(phone_number, request_id):
         url = f"https://api.businessmessaging.jio.com/v1/messaging/users/{formatted_phone}/capabilities"
         params = {"requestId": request_id}
 
-        headers = {"Authorization": f"Bearer {bot_state.token}"}
+        headers = {"Authorization": f"Bearer {token}"}
 
         response = requests.get(
             url, 
@@ -1625,10 +1708,16 @@ def check_batch_capability(phone_numbers_batch, batch_index, total_batches):
         return {"success": False, "batch_phones": phone_numbers_batch}
 
 def send_message_with_retry(phone_number, message_id=None, max_retries=100):
-    """Send single message with retry logic and timeout"""
+    """Send single message with retry logic and timeout.
+    Automatically uses the correct config/token for this phone number.
+    Zero DB calls — all lookups are in-memory.
+    """
+    config_index = bot_state.phone_to_config_index.get(phone_number) if bot_state.is_multi_config else None
+
     for attempt in range(max_retries):
         try:
-            if not refresh_token_if_needed():
+            token, assistant_id = get_token_for_message(phone_number)
+            if not token:
                 if attempt == max_retries - 1:
                     return False
                 time.sleep(0.1)
@@ -1640,16 +1729,16 @@ def send_message_with_retry(phone_number, message_id=None, max_retries=100):
             else:
                 message_id = str(message_id)
 
-            # Build URL
+            # Build URL with properly formatted phone
             phone_clean = str(phone_number).strip()
             if not phone_clean.startswith('+91'):
                 phone_clean = f"+91{phone_clean}"
             
             url = f"https://api.businessmessaging.jio.com/v1/messaging/users/{phone_clean}/assistantMessages/async"
-            url += f"?messageId={message_id}&assistantId={bot_state.assistant_id}"
+            url += f"?messageId={message_id}&assistantId={assistant_id}"
 
             headers = {
-                "Authorization": f"Bearer {bot_state.token}",
+                "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json"
             }
 
@@ -1660,25 +1749,18 @@ def send_message_with_retry(phone_number, message_id=None, max_retries=100):
             
             # Extract the actual content to send
             if isinstance(bot_state.payload, dict):
-                # Check if payload has a 'content' field (common pattern)
                 if 'content' in bot_state.payload:
                     content_to_send = bot_state.payload['content']
-                    logger.debug(f"Using content from payload.content field")
                 else:
-                    # Use the entire payload as content
                     content_to_send = bot_state.payload
-                    logger.debug(f"Using entire payload as content")
             else:
                 content_to_send = bot_state.payload
-                logger.debug(f"Using payload as-is (type: {type(bot_state.payload)})")
 
             # Ensure content_to_send is serializable
             if isinstance(content_to_send, str):
                 try:
-                    # Try to parse if it's a JSON string
                     content_to_send = json.loads(content_to_send)
                 except:
-                    # Keep as string if not valid JSON
                     pass
 
             data = {
@@ -1686,8 +1768,6 @@ def send_message_with_retry(phone_number, message_id=None, max_retries=100):
                 "content": content_to_send
             }
 
-            logger.debug(f"Sending to {phone_clean} with messageId {message_id}")
-            
             response = requests.post(
                 url, 
                 headers=headers, 
@@ -1701,7 +1781,7 @@ def send_message_with_retry(phone_number, message_id=None, max_retries=100):
                 return True
             elif response.status_code == 401:
                 logger.debug(f"🔄 Token expired for {phone_number}, refreshing...")
-                refresh_token_if_needed()
+                refresh_token_if_needed(config_index)
             elif response.status_code == 400:
                 logger.error(f"❌ Bad request for {phone_number}: {response.text}")
                 logger.error(f"Data sent: {json.dumps(data, indent=2)[:500]}")
@@ -1827,8 +1907,18 @@ def process_campaign():
     else:
         logger.error("❌ No payload found in campaign data")
         bot_state.payload = {}
+
+    # Multi-config setup (all in-memory, no extra DB calls)
+    bot_state.is_multi_config = data.get('is_multi_config', False)
+    bot_state.jio_configs = data.get('jio_configs', [])
+    bot_state.phone_to_config_index = data.get('phone_config_map', {})
+    bot_state.config_tokens = {}
+    bot_state.config_token_times = {}
+    bot_state.config_token_locks = {}
     
     logger.info(f"📋 Processing campaign: {data['campaign_name']} ({len(bot_state.phone_numbers)} contacts)")
+    if bot_state.is_multi_config:
+        logger.info(f"🔀 Multi-config mode: {len(bot_state.jio_configs)} configs")
     
     # Mark as running
     if not mark_campaign_running(bot_state.maincampainid):
@@ -1836,16 +1926,34 @@ def process_campaign():
         bot_state.processing_campaign = False
         return None
     
-    # Get token
-    logger.info("🔐 Getting initial token...")
-    bot_state.token = get_token(bot_state.assistant_id, bot_state.client_secret)
-    if not bot_state.token:
-        logger.error("Authentication failed")
-        mark_campaign_completed(bot_state.maincampainid)
-        bot_state.processing_campaign = False
-        return None
-    
-    bot_state.token_generated_time = time.time()
+    # Get tokens — one per config in multi-config, or single token
+    if bot_state.is_multi_config and len(bot_state.jio_configs) > 0:
+        logger.info(f"🔐 Getting tokens for {len(bot_state.jio_configs)} configs...")
+        all_tokens_ok = True
+        for i, cfg in enumerate(bot_state.jio_configs):
+            bot_state.config_token_locks[i] = threading.Lock()
+            token = get_token(cfg["clientId"], cfg["clientSecret"])
+            if token:
+                bot_state.config_tokens[i] = token
+                bot_state.config_token_times[i] = time.time()
+                logger.info(f"  ✅ Config {i} ({cfg.get('label', 'Bot ' + str(i+1))}): token OK")
+            else:
+                logger.error(f"  ❌ Config {i}: token FAILED")
+                all_tokens_ok = False
+        if not any(bot_state.config_tokens.values()):
+            logger.error("All config tokens failed")
+            mark_campaign_completed(bot_state.maincampainid)
+            bot_state.processing_campaign = False
+            return None
+    else:
+        logger.info("🔐 Getting initial token...")
+        bot_state.token = get_token(bot_state.assistant_id, bot_state.client_secret)
+        if not bot_state.token:
+            logger.error("Authentication failed")
+            mark_campaign_completed(bot_state.maincampainid)
+            bot_state.processing_campaign = False
+            return None
+        bot_state.token_generated_time = time.time()
     
     # Check capabilities
     capable, non_capable, missing = check_rcs_capabilities(bot_state.phone_numbers)
@@ -1893,10 +2001,9 @@ def process_campaign():
         
         # Log progress
         with bot_state.lock:
-            if len(capable) > 0:
-                progress = (bot_state.current_index / len(capable)) * 100
-                logger.info(f"📊 Progress: {bot_state.current_index}/{len(capable)} ({progress:.1f}%) - "
-                           f"Sent: {bot_state.count}, Failed: {bot_state.fail}")
+            progress = (bot_state.current_index / len(capable)) * 100
+            logger.info(f"📊 Progress: {bot_state.current_index}/{len(capable)} ({progress:.1f}%) - "
+                       f"Sent: {bot_state.count}, Failed: {bot_state.fail}")
         
         # Check if workers are stuck
         if time.time() - start_time > 3600:  # 1 hour timeout
