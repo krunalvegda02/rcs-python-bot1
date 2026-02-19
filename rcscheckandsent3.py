@@ -1076,6 +1076,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress pymongo logging to avoid connection pool noise
+logging.getLogger('pymongo').setLevel(logging.CRITICAL)
+
 # Global variables with proper initialization
 class BotState:
     def __init__(self):
@@ -1925,6 +1928,10 @@ def process_campaign():
         logger.error("Failed to mark campaign as Running")
         bot_state.processing_campaign = False
         return None
+    
+    # Close MongoDB connection - we don't need it for sending messages
+    logger.info("🔌 Closing MongoDB connection (not needed for message sending)")
+    close_mongo_connections()
     
     # Get tokens — one per config in multi-config, or single token
     if bot_state.is_multi_config and len(bot_state.jio_configs) > 0:
