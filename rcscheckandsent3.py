@@ -2012,9 +2012,9 @@ def process_campaign():
             logger.info(f"📊 Progress: {bot_state.current_index}/{len(capable)} ({progress:.1f}%) - "
                        f"Sent: {bot_state.count}, Failed: {bot_state.fail}")
         
-        # Check if workers are stuck
-        if time.time() - start_time > 3600:  # 1 hour timeout
-            logger.warning("Campaign taking too long, forcing completion")
+        # Check if workers are stuck (increased to 6 hours)
+        if time.time() - start_time > 10800:  # 6 hour timeout
+            logger.warning("Campaign taking too long (>6 hours), forcing completion")
             break
     
     # Wait for workers to finish
