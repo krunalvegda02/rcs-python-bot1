@@ -1710,7 +1710,7 @@ def check_batch_capability(phone_numbers_batch, batch_index, total_batches):
         logger.error(f"Batch {batch_index} exception: {e}")
         return {"success": False, "batch_phones": phone_numbers_batch}
 
-def send_message_with_retry(phone_number, message_id=None, max_retries=100):
+def send_message_with_retry(phone_number, message_id=None, max_retries=50):
     """Send single message with retry logic and timeout.
     Automatically uses the correct config/token for this phone number.
     Zero DB calls — all lookups are in-memory.
@@ -1800,8 +1800,6 @@ def send_message_with_retry(phone_number, message_id=None, max_retries=100):
             logger.debug(f"❌ Exception for {phone_number}: {e}")
             if attempt == max_retries - 1:
                 logger.error(f"Failed to send to {phone_number} after {max_retries} attempts: {e}")
-            else:
-                time.sleep(0.05)
     
     return False
 
@@ -1849,7 +1847,7 @@ def worker_thread(worker_id):
                     bot_state.retrylist.append(number)
             
             # Small yield to prevent CPU overload
-            time.sleep(0.001)
+            # No sleep - maximize throughput
             
     except Exception as e:
         logger.error(f"Worker-{worker_id} crashed: {e}")
