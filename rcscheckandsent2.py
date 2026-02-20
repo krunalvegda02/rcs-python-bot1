@@ -1990,7 +1990,7 @@ def process_campaign():
     logger.info(f"🎯 Starting message sending to {len(capable)} capable contacts")
     
     # Start workers
-    num_workers = 100
+    num_workers = 150
     threads = []
     start_time = time.time()
     
