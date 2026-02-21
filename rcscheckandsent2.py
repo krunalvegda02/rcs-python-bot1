@@ -1712,8 +1712,8 @@ def check_batch_capability(phone_numbers_batch, batch_index, total_batches):
         logger.error(f"Batch {batch_index} exception: {e}")
         return {"success": False, "batch_phones": phone_numbers_batch}
 
-async def send_message_async(session, phone_number, message_id=None, max_retries=50):
-    """Async send message with retry logic."""
+async def send_message_async(session, phone_number, message_id=None, max_retries=100):
+    """Async send message with aggressive retry logic."""
     config_index = bot_state.phone_to_config_index.get(phone_number) if bot_state.is_multi_config else None
 
     for attempt in range(max_retries):
@@ -1762,29 +1762,26 @@ async def send_message_async(session, phone_number, message_id=None, max_retries
                 "content": content_to_send
             }
 
-            timeout = aiohttp.ClientTimeout(total=3)
+            timeout = aiohttp.ClientTimeout(total=5)
             async with session.post(url, headers=headers, json=data, ssl=False, timeout=timeout) as response:
                 if response.status == 201:
-                    logger.debug(f"✅ Successfully sent to {phone_number}")
                     return True
                 elif response.status == 401:
-                    logger.debug(f"🔄 Token expired for {phone_number}, refreshing...")
                     refresh_token_if_needed(config_index)
+                    await asyncio.sleep(0.1)
                 elif response.status == 400:
                     text = await response.text()
                     logger.error(f"❌ Bad request for {phone_number}: {text}")
                     return False
-                else:
-                    logger.debug(f"⚠️ Got status {response.status} for {phone_number}, retry {attempt + 1}")
                 
         except asyncio.TimeoutError:
-            logger.debug(f"⏰ Timeout for {phone_number}, retry {attempt + 1}")
-        except aiohttp.ClientError as e:
-            logger.debug(f"🔌 Connection error for {phone_number}, retry {attempt + 1}")
+            await asyncio.sleep(0.05)
+        except aiohttp.ClientError:
+            await asyncio.sleep(0.05)
         except Exception as e:
-            logger.debug(f"❌ Exception for {phone_number}: {e}")
             if attempt == max_retries - 1:
                 logger.error(f"Failed to send to {phone_number} after {max_retries} attempts: {e}")
+            await asyncio.sleep(0.05)
     
     return False
 
@@ -1974,7 +1971,7 @@ def process_campaign():
     logger.info(f"🎯 Starting message sending to {len(capable)} capable contacts")
     
     # Start async workers
-    num_workers = 150
+    num_workers = 120
     start_time = time.time()
     
     # Run async workers in a separate thread
