@@ -1981,21 +1981,27 @@ def process_campaign():
     worker_thread = threading.Thread(target=worker_thread_wrapper, args=(num_workers,), daemon=True)
     worker_thread.start()
     
-    # Monitor progress
-    while bot_state.active_workers > 0 and bot_state.is_running:
+    # Monitor progress - wait indefinitely until ALL messages sent
+    while bot_state.is_running:
         time.sleep(5)
         update_heartbeat()
         
         with bot_state.lock:
-            progress = (bot_state.current_index / len(capable)) * 100
-            logger.info(f"📊 Progress: {bot_state.current_index}/{len(capable)} ({progress:.1f}%) - "
-                       f"Sent: {bot_state.count}, Failed: {bot_state.fail}")
+            all_done = (bot_state.active_workers == 0 and bot_state.current_index >= len(capable))
+            if len(capable) > 0:
+                progress = (bot_state.current_index / len(capable)) * 100
+                logger.info(f"📊 Progress: {bot_state.current_index}/{len(capable)} ({progress:.1f}%) - "
+                           f"Sent: {bot_state.count}, Failed: {bot_state.fail}, Active Workers: {bot_state.active_workers}")
         
-        if time.time() - start_time > 10800:
-            logger.warning("Campaign taking too long (>6 hours), forcing completion")
+        if all_done:
+            logger.info("✅ All workers finished and all messages processed")
             break
     
-    worker_thread.join(timeout=30)
+    # Wait for worker thread to finish
+    worker_thread.join()
+    
+    # Extra safety: ensure all async tasks completed
+    time.sleep(2)
     
     processing_time = time.time() - start_time
     
