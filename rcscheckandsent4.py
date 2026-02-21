@@ -1061,6 +1061,8 @@ import logging
 from queue import Queue
 from threading import Event
 import atexit
+import asyncio
+import aiohttp
 
 # Disable warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -1710,11 +1712,8 @@ def check_batch_capability(phone_numbers_batch, batch_index, total_batches):
         logger.error(f"Batch {batch_index} exception: {e}")
         return {"success": False, "batch_phones": phone_numbers_batch}
 
-def send_message_with_retry(phone_number, message_id=None, max_retries=50):
-    """Send single message with retry logic and timeout.
-    Automatically uses the correct config/token for this phone number.
-    Zero DB calls — all lookups are in-memory.
-    """
+async def send_message_async(session, phone_number, message_id=None, max_retries=50):
+    """Async send message with retry logic."""
     config_index = bot_state.phone_to_config_index.get(phone_number) if bot_state.is_multi_config else None
 
     for attempt in range(max_retries):
@@ -1723,16 +1722,14 @@ def send_message_with_retry(phone_number, message_id=None, max_retries=50):
             if not token:
                 if attempt == max_retries - 1:
                     return False
-                time.sleep(0.1)
+                await asyncio.sleep(0.1)
                 continue
 
-            # Generate message ID if not provided
             if not message_id:
                 message_id = f"msg-{uuid.uuid4().hex[:8]}"
             else:
                 message_id = str(message_id)
 
-            # Build URL with properly formatted phone
             phone_clean = str(phone_number).strip()
             if not phone_clean.startswith('+91'):
                 phone_clean = f"+91{phone_clean}"
@@ -1745,21 +1742,15 @@ def send_message_with_retry(phone_number, message_id=None, max_retries=50):
                 "Content-Type": "application/json"
             }
 
-            # Check if payload exists
             if not bot_state.payload:
                 logger.error(f"❌ No payload for {phone_number}")
                 return False
             
-            # Extract the actual content to send
             if isinstance(bot_state.payload, dict):
-                if 'content' in bot_state.payload:
-                    content_to_send = bot_state.payload['content']
-                else:
-                    content_to_send = bot_state.payload
+                content_to_send = bot_state.payload.get('content', bot_state.payload)
             else:
                 content_to_send = bot_state.payload
 
-            # Ensure content_to_send is serializable
             if isinstance(content_to_send, str):
                 try:
                     content_to_send = json.loads(content_to_send)
@@ -1771,64 +1762,47 @@ def send_message_with_retry(phone_number, message_id=None, max_retries=50):
                 "content": content_to_send
             }
 
-            response = requests.post(
-                url, 
-                headers=headers, 
-                json=data, 
-                verify=False, 
-                timeout=10
-            )
-
-            if response.status_code == 201:
-                logger.debug(f"✅ Successfully sent to {phone_number}")
-                return True
-            elif response.status_code == 401:
-                logger.debug(f"🔄 Token expired for {phone_number}, refreshing...")
-                refresh_token_if_needed(config_index)
-            elif response.status_code == 400:
-                logger.error(f"❌ Bad request for {phone_number}: {response.text}")
-                logger.error(f"Data sent: {json.dumps(data, indent=2)[:500]}")
-                return False
-            else:
-                logger.debug(f"⚠️ Got status {response.status_code} for {phone_number}, retry {attempt + 1}")
+            timeout = aiohttp.ClientTimeout(total=3)
+            async with session.post(url, headers=headers, json=data, ssl=False, timeout=timeout) as response:
+                if response.status == 201:
+                    logger.debug(f"✅ Successfully sent to {phone_number}")
+                    return True
+                elif response.status == 401:
+                    logger.debug(f"🔄 Token expired for {phone_number}, refreshing...")
+                    refresh_token_if_needed(config_index)
+                elif response.status == 400:
+                    text = await response.text()
+                    logger.error(f"❌ Bad request for {phone_number}: {text}")
+                    return False
+                else:
+                    logger.debug(f"⚠️ Got status {response.status} for {phone_number}, retry {attempt + 1}")
                 
-        except requests.exceptions.Timeout:
+        except asyncio.TimeoutError:
             logger.debug(f"⏰ Timeout for {phone_number}, retry {attempt + 1}")
-        except requests.exceptions.ConnectionError:
+        except aiohttp.ClientError as e:
             logger.debug(f"🔌 Connection error for {phone_number}, retry {attempt + 1}")
         except Exception as e:
             logger.debug(f"❌ Exception for {phone_number}: {e}")
             if attempt == max_retries - 1:
                 logger.error(f"Failed to send to {phone_number} after {max_retries} attempts: {e}")
-
+    
     return False
 
-def worker_thread(worker_id):
-    """Worker function with heartbeat and error handling"""
+async def async_worker(worker_id, session):
+    """Async worker function"""
     logger.info(f"🧵 Worker-{worker_id} started")
-    last_activity = time.time()
     
     with bot_state.lock:
         bot_state.active_workers += 1
     
     try:
-        while bot_state.is_running:
-            # Check if we should continue
-            if not bot_state.processing_campaign:
-                time.sleep(1)
-                continue
-                
+        while bot_state.is_running and bot_state.processing_campaign:
             # Get next number
             with bot_state.lock:
                 if bot_state.current_index >= len(bot_state.capable_numbers):
                     break
                 number = bot_state.capable_numbers[bot_state.current_index]
                 bot_state.current_index += 1
-                last_activity = time.time()
-            
-            # Check for idle timeout
-            if time.time() - last_activity > MAX_WORKER_IDLE_TIME:
-                logger.warning(f"Worker-{worker_id} idle for too long, but continuing")
             
             # Refresh token periodically
             if bot_state.current_index % 500 == 0:
@@ -1836,7 +1810,7 @@ def worker_thread(worker_id):
             
             # Send message
             message_id = bot_state.phone_to_message_id.get(number)
-            success = send_message_with_retry(number, message_id)
+            success = await send_message_async(session, number, message_id)
             
             with bot_state.lock:
                 if success:
@@ -1846,9 +1820,6 @@ def worker_thread(worker_id):
                     bot_state.fail += 1
                     bot_state.retrylist.append(number)
             
-            # Small yield to prevent CPU overload
-            # No sleep - maximize throughput
-            
     except Exception as e:
         logger.error(f"Worker-{worker_id} crashed: {e}")
         traceback.print_exc()
@@ -1857,6 +1828,19 @@ def worker_thread(worker_id):
         with bot_state.lock:
             bot_state.active_workers -= 1
         logger.info(f"🧵 Worker-{worker_id} stopped")
+
+async def run_async_workers(num_workers):
+    """Run async workers with shared session"""
+    connector = aiohttp.TCPConnector(limit=200, limit_per_host=50)
+    timeout = aiohttp.ClientTimeout(total=30)
+    
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        tasks = [async_worker(i + 1, session) for i in range(num_workers)]
+        await asyncio.gather(*tasks)
+
+def worker_thread_wrapper(num_workers):
+    """Wrapper to run async workers in a thread"""
+    asyncio.run(run_async_workers(num_workers))
 
 def process_campaign():
     """Main campaign processing function"""
@@ -1989,35 +1973,29 @@ def process_campaign():
     
     logger.info(f"🎯 Starting message sending to {len(capable)} capable contacts")
     
-    # Start workers
-    num_workers = 150  # Balanced for 2-core CPU
-    threads = []
+    # Start async workers
+    num_workers = 150
     start_time = time.time()
     
-    for i in range(num_workers):
-        t = threading.Thread(target=worker_thread, args=(i + 1,), daemon=True)
-        t.start()
-        threads.append(t)
+    # Run async workers in a separate thread
+    worker_thread = threading.Thread(target=worker_thread_wrapper, args=(num_workers,), daemon=True)
+    worker_thread.start()
     
-    # Monitor workers
+    # Monitor progress
     while bot_state.active_workers > 0 and bot_state.is_running:
         time.sleep(5)
         update_heartbeat()
         
-        # Log progress
         with bot_state.lock:
             progress = (bot_state.current_index / len(capable)) * 100
             logger.info(f"📊 Progress: {bot_state.current_index}/{len(capable)} ({progress:.1f}%) - "
                        f"Sent: {bot_state.count}, Failed: {bot_state.fail}")
         
-        # Check if workers are stuck (increased to 6 hours)
-        if time.time() - start_time > 10800:  # 6 hour timeout
+        if time.time() - start_time > 10800:
             logger.warning("Campaign taking too long (>6 hours), forcing completion")
             break
     
-    # Wait for workers to finish
-    for t in threads:
-        t.join(timeout=30)
+    worker_thread.join(timeout=30)
     
     processing_time = time.time() - start_time
     
