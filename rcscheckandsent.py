@@ -1120,8 +1120,8 @@ class BotState:
 bot_state = BotState()
 
 # Database configuration
-MONGODB_URI = "mongodb://admin:Gama%401234@157.173.113.237:27017/rcsdb?authSource=admin&replicaSet=rs0"
-DATABASE_NAME = "rcsdb"
+MONGODB_URI = "mongodb+srv://sikarwarvishal75_db_user:Gama%40123@cluster0.whqwih.mongodb.net/rcs?retryWrites=true&w=majority"
+DATABASE_NAME = "rcs"
 
 # Constants
 MAX_API_LIMIT = 10000
@@ -1150,11 +1150,11 @@ def get_mongo_client():
                     maxPoolSize=50,
                     minPoolSize=10,
                     maxIdleTimeMS=45000,
-                    connectTimeoutMS=30000,
-                    socketTimeoutMS=45000,
-                    serverSelectionTimeoutMS=30000,
-                    retryWrites=False,
-                    retryReads=False,
+                    connectTimeoutMS=60000,
+                    socketTimeoutMS=120000,
+                    serverSelectionTimeoutMS=60000,
+                    retryWrites=True,
+                    retryReads=True
                    
                 )
                 # Test connection
