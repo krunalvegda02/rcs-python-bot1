@@ -1120,7 +1120,7 @@ class BotState:
 bot_state = BotState()
 
 # Database configuration
-MONGODB_URI = "mongodb://admin:Gama%401234@157.173.113.237:27017/rcsdb?authSource=admin"
+MONGODB_URI = "mongodb://admin:Gama%401234@157.173.113.237:27017/rcsdb?authSource=admin&replicaSet=rs0"
 DATABASE_NAME = "rcsdb"
 
 # Constants
@@ -1153,8 +1153,9 @@ def get_mongo_client():
                     connectTimeoutMS=30000,
                     socketTimeoutMS=45000,
                     serverSelectionTimeoutMS=30000,
-                    retryWrites=True,
-                    retryReads=True
+                    retryWrites=False,
+                    retryReads=False,
+                
                 )
                 # Test connection
                 mongo_client.admin.command('ping')
