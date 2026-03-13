@@ -1120,8 +1120,8 @@ class BotState:
 bot_state = BotState()
 
 # Database configuration
-MONGODB_URI = "mongodb+srv://sikarwarvishal75_db_user:Gama%40123@cluster0.whqwih.mongodb.net/rcs?retryWrites=true&w=majority"
-DATABASE_NAME = "rcs"
+MONGODB_URI = "mongodb://admin:Gama%401234@157.173.113.237:27017/rcsdb?authSource=admin"
+DATABASE_NAME = "rcsdb"
 
 # Constants
 MAX_API_LIMIT = 10000
